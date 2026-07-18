@@ -1,18 +1,33 @@
 # HRアナリティクス疑似データセット
 
 コア人事システムからの抽出を模した、正規化済み複数テーブル構成の疑似データセットです。
-Azure上でのHRアナリティクス・パイプライン(Blob Storage → Data Factory/Functions →
+Azure上でのHRアナリティクス・パイプライン(Blob Storage → Functions →
 SQL Database Serverless → Power BI)のデモ用に生成しました。
 
 実在の個人・組織とは一切関係のない、統計的に生成した架空データです。
+
+## パイプライン実装状況
+
+| コンポーネント | 状態 | 内容 |
+|---|---|---|
+| Blob Storage | ✅ 実装済み | 疑似データセット(CSV5ファイル)を`hr-raw-data`コンテナーに格納 |
+| Function App | ✅ 実装済み | Python 3.12・Flex従量課金プラン。5テーブルの読み込み・変換・SQL Database書き込みを実行(コードは`Azure-function/`配下) |
+| SQL Database | ✅ 実装済み | Serverlessティア。5テーブルを正規化したまま格納(FK制約あり) |
+| Power BI | ✅ 実装済み | SQL Databaseと直接接続し、リレーションシップを自動検出。全社サマリ／離職分析／評価×勤怠分析の3ページ構成 |
+| CI/CD自動化 | 🔲 未着手 | 現状は手動デプロイ(`func azure functionapp publish`)。将来的にGitHub Actions等での自動化を検討中 |
 
 ## なぜ単一のフラットCSVではなく5テーブルに分割したか
 
 実務のコア人事システムからのデータ抽出は、基本的に正規化されたテーブル群として
 出力されます。単一の分析用フラットファイルを最初から用意してしまうと、
 「ETLで結合・変換する」という工程そのものが再現できません。このデータセットでは
-あえて正規化した状態で生成し、Data Factory / Functions 側での **JOIN・集計・
-非正規化(analytics-ready化)** の設計判断を見せられるようにしています。
+あえて正規化した状態で生成し、Functions側での**JOIN・集計・非正規化(analytics-ready化)**
+の設計判断を見せられるようにしています。
+
+さらに、SQL Database側も正規化した5テーブルのまま格納する設計にしました。理由は、
+Power BI側でリレーションシップ(スタースキーマ)を組んでモデリングする、という
+実務でよくあるパターン(SQL/DWHは正規化のまま持ち、BI層でモデリングする)を
+再現するためです。
 
 ## テーブル構成
 
@@ -31,6 +46,20 @@ department_master ──┬─< employee_master ──┬─< evaluation_history
                      │                      ├─< attendance_summary
                      │                      └─< attrition
 ```
+
+SQL Database側も同じER構成のまま、外部キー制約付きで格納しています。
+
+## Azure Function App(`Azure-function/`)
+
+Blob Storageから5テーブルを読み込み、SQL Databaseへの書き込みとBlobへのanalytics-ready
+フラットCSV出力の両方を行うHTTPトリガー関数です。
+
+- **接続ライブラリにpymssqlを採用**:Flex従量課金プラン(Linux)はrootアクセスがなく、
+  `pyodbc`が要求するODBC Driverを追加インストールできないため、単体で動く`pymssql`を選択
+- **書き込みは洗い替え(full refresh)方式**:実行のたびに既存データを`DELETE`してから
+  再投入する設計。冪等性を確保し、複数テーブルへの書き込みは1トランザクションにまとめて
+  途中失敗時のロールバックを保証
+- **NaN/空文字列の正規化**:`pd.isna()`ベースの判定でSQL用のNULLに変換
 
 ## 生成ロジックの設計ポイント
 
@@ -57,3 +86,8 @@ python3 generate_hr_synthetic_data.py
 
 全CSVは `utf-8-sig` (UTF-8 with BOM) で出力しています。Excelで直接開いても
 日本語が文字化けしません。
+
+## 関連リンク
+
+- 構築の過程で得た気づきは [note](https://note.com/kambaralab) で連載中
+- 技術的な深掘り記事は [kambaralab.com](https://kambaralab.com) にて公開予定
