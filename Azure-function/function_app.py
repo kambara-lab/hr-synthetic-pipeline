@@ -6,6 +6,81 @@ import os
 import io
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
+import pymssql
+
+SQL_TABLE_COLUMNS = {
+    "department_master": ["department_id", "department_name", "division"],
+    "employee_master": [
+        "employee_id", "name", "gender", "birth_date", "hire_date",
+        "department_id", "position", "employment_type", "salary_grade",
+    ],
+    "evaluation_history": [
+        "employee_id", "fiscal_year", "evaluation_grade", "evaluation_score",
+    ],
+    "attendance_summary": [
+        "employee_id", "year_month", "overtime_hours", "absence_days",
+        "paid_leave_used_days",
+    ],
+    "attrition": [
+        "employee_id", "attrition_flag", "attrition_date", "attrition_reason_category",
+    ],
+}
+
+
+def _get_sql_connection():
+    return pymssql.connect(
+        server=os.environ["SQL_SERVER"],
+        database=os.environ["SQL_DATABASE"],
+        user=os.environ["SQL_USER"],
+        password=os.environ["SQL_PASSWORD"],
+    )
+
+
+def _clean_value(v):
+    """pandasの欠損値(NaN/NA/NaTなど)や空文字列を、SQL用のNoneに正規化する"""
+    if pd.isna(v):
+        return None
+    if isinstance(v, str) and v == "":
+        return None
+    return v
+
+
+def _write_df_to_sql(cursor, table_name, df):
+    columns = SQL_TABLE_COLUMNS[table_name]
+
+    placeholders = ", ".join(["%s"] * len(columns))
+    col_list = ", ".join(columns)
+    insert_sql = f"INSERT INTO {table_name} ({col_list}) VALUES ({placeholders})"
+
+    records = [
+        tuple(_clean_value(row[col]) for col in columns)
+        for _, row in df.iterrows()
+    ]
+    if records:
+        cursor.executemany(insert_sql, records)
+    logging.info(f"{table_name}: {len(records)}件 書き込み")
+
+
+def _load_to_sql_database(df_department, df_employee, df_evaluation, df_attendance, df_attrition):
+    conn = _get_sql_connection()
+    try:
+        cursor = conn.cursor()
+
+        # 既存データをクリア(FK制約があるため、子テーブル→親テーブルの順)
+        for table in ["evaluation_history", "attendance_summary", "attrition",
+                      "employee_master", "department_master"]:
+            cursor.execute(f"DELETE FROM {table}")
+
+        # 親テーブルから順に投入
+        _write_df_to_sql(cursor, "department_master", df_department)
+        _write_df_to_sql(cursor, "employee_master", df_employee)
+        _write_df_to_sql(cursor, "evaluation_history", df_evaluation)
+        _write_df_to_sql(cursor, "attendance_summary", df_attendance)
+        _write_df_to_sql(cursor, "attrition", df_attrition)
+
+        conn.commit()
+    finally:
+        conn.close()
 
 app = func.FunctionApp()
 
@@ -34,6 +109,8 @@ def transform(req: func.HttpRequest) -> func.HttpResponse:
         df_evaluation = _read_csv_from_blob(source_container, "evaluation_history.csv")
         df_attendance = _read_csv_from_blob(source_container, "attendance_summary.csv")
         df_attrition = _read_csv_from_blob(source_container, "attrition.csv")
+
+        _load_to_sql_database(df_department, df_employee, df_evaluation, df_attendance, df_attrition)
 
         # 最新年度の評価だけを抽出
         latest_fy = df_evaluation["fiscal_year"].max()
